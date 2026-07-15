@@ -9,13 +9,16 @@ from typing import Any
 
 @dataclass
 class Position:
-    """A monitored XAUUSD position from the cTrader Copy investor page."""
+    """A monitored position from the cTrader Copy investor page."""
 
     position_id: str
     symbol: str
     side: str
     entry_price: float
     volume: float
+    current_price: float | None = None
+    sl: float | None = None
+    tp: float | None = None
     closed: bool = False
     opened_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
@@ -33,6 +36,13 @@ class Position:
             side=str(data["side"]),
             entry_price=float(data["entry_price"]),
             volume=float(data["volume"]),
+            current_price=(
+                float(data["current_price"])
+                if data.get("current_price") is not None
+                else None
+            ),
+            sl=float(data["sl"]) if data.get("sl") is not None else None,
+            tp=float(data["tp"]) if data.get("tp") is not None else None,
             closed=bool(data.get("closed", False)),
             opened_at=data.get(
                 "opened_at", datetime.now(timezone.utc).isoformat()
@@ -79,7 +89,7 @@ class PositionStore:
         }
 
     def upsert(self, position: Position) -> bool:
-        """Insert or refresh a position. Returns True when it is new."""
+        """Insert or refresh a position. Returns True when new or updated."""
         is_new = position.position_id not in self._positions
         existing = self._positions.get(position.position_id)
 
@@ -87,6 +97,17 @@ class PositionStore:
             position.opened_at = existing.opened_at
             position.closed = existing.closed
             position.closed_at = existing.closed_at
+            updated = (
+                existing.symbol != position.symbol
+                or existing.side != position.side
+                or existing.entry_price != position.entry_price
+                or existing.current_price != position.current_price
+                or existing.volume != position.volume
+                or existing.sl != position.sl
+                or existing.tp != position.tp
+            )
+            self._positions[position.position_id] = position
+            return updated
 
         self._positions[position.position_id] = position
         return is_new
