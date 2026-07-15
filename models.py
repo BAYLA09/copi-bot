@@ -120,3 +120,96 @@ class PositionStore:
         position.closed = True
         position.closed_at = datetime.now(timezone.utc).isoformat()
         return True
+
+
+@dataclass
+class PositionMapping:
+    """Maps a source copy position to a destination API position."""
+
+    source_position_id: str
+    destination_position_id: int
+    symbol: str
+    side: str
+    volume: float
+    api_volume: int
+    status: str = "open"
+    opened_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    closed_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> PositionMapping:
+        return cls(
+            source_position_id=str(data["source_position_id"]),
+            destination_position_id=int(data["destination_position_id"]),
+            symbol=str(data["symbol"]),
+            side=str(data["side"]),
+            volume=float(data["volume"]),
+            api_volume=int(data["api_volume"]),
+            status=str(data.get("status", "open")),
+            opened_at=data.get(
+                "opened_at", datetime.now(timezone.utc).isoformat()
+            ),
+            closed_at=data.get("closed_at"),
+        )
+
+
+class MappingStore:
+    """Persist source-to-destination position mappings."""
+
+    def __init__(self, path: Path | str = "mapping.json") -> None:
+        self.path = Path(path)
+        self._mappings: dict[str, PositionMapping] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            self._mappings = {}
+            return
+
+        with self.path.open(encoding="utf-8") as handle:
+            raw = json.load(handle)
+
+        self._mappings = {
+            source_id: PositionMapping.from_dict(item)
+            for source_id, item in raw.items()
+        }
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            source_id: mapping.to_dict()
+            for source_id, mapping in self._mappings.items()
+        }
+        with self.path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+    def get(self, source_position_id: str) -> PositionMapping | None:
+        return self._mappings.get(source_position_id)
+
+    def has_open_mapping(self, source_position_id: str) -> bool:
+        mapping = self._mappings.get(source_position_id)
+        return mapping is not None and mapping.status == "open"
+
+    def add(self, mapping: PositionMapping) -> None:
+        self._mappings[mapping.source_position_id] = mapping
+
+    def iter_open_mappings(self) -> list[PositionMapping]:
+        return [
+            mapping
+            for mapping in self._mappings.values()
+            if mapping.status == "open"
+        ]
+
+    def mark_closed(self, source_position_id: str) -> bool:
+        mapping = self._mappings.get(source_position_id)
+        if mapping is None or mapping.status == "closed":
+            return False
+
+        mapping.status = "closed"
+        mapping.closed_at = datetime.now(timezone.utc).isoformat()
+        return True
