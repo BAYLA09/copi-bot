@@ -10,7 +10,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from ctrader_api import CTraderAPIError, CTraderTradingClient
-from models import MappingStore, Position, PositionMapping, PositionStore
+from destinations.base import BaseDestinationExecutor
+from destinations.ctrader import CTraderDestinationExecutor
+from destinations.ftmo import FTMOTDestinationExecutor
+from models import MappingStore, Position
 
 load_dotenv()
 
@@ -24,41 +27,56 @@ logger = logging.getLogger(__name__)
 POLL_INTERVAL_SECONDS = float(os.getenv("COPIER_POLL_INTERVAL", "1"))
 POSITIONS_FILE = Path(os.getenv("POSITIONS_FILE", "positions.json"))
 MAPPING_FILE = Path(os.getenv("MAPPING_FILE", "mapping.json"))
+DESTINATION_BROKER = os.getenv("DESTINATION_BROKER", "ctrader").strip().lower()
+
+
+def build_executor(mapping_store: MappingStore) -> BaseDestinationExecutor:
+    if DESTINATION_BROKER == "ftmo":
+        return FTMOTDestinationExecutor()
+
+    client = CTraderTradingClient.from_env(role="destination")
+    return CTraderDestinationExecutor(client, mapping_store)
 
 
 class PositionCopier:
-    """Watch positions.json and mirror trades on a destination cTrader account."""
+    """Watch positions.json and mirror trades through a destination executor."""
 
     def __init__(
         self,
-        api_client: CTraderTradingClient,
+        executor: BaseDestinationExecutor,
         positions_file: Path,
         mapping_store: MappingStore,
         *,
         poll_interval: float = POLL_INTERVAL_SECONDS,
     ) -> None:
-        self.api_client = api_client
+        self.executor = executor
         self.positions_file = positions_file
         self.mapping_store = mapping_store
         self.poll_interval = poll_interval
         self._positions_mtime: float | None = None
         self._pending_opens: set[str] = set()
         self._pending_closes: set[str] = set()
+        self._pending_modifies: set[str] = set()
+        self._last_snapshot: dict[str, Position] = {}
 
     async def run(self) -> None:
         logger.info(
-            "Starting position copier. Watching %s, mapping file %s, poll interval %ss",
+            "Starting position copier via %s. Watching %s, mapping file %s",
+            self.executor.name,
             self.positions_file,
             self.mapping_store.path,
-            self.poll_interval,
         )
         while True:
             try:
                 if self._positions_changed():
                     await self._process_positions()
             except CTraderAPIError:
-                logger.exception("cTrader API error while copying trades.")
-                await self._reconnect_api()
+                logger.exception("Destination API error while copying trades.")
+                if isinstance(self.executor, CTraderDestinationExecutor):
+                    await self.executor.client.reconnect()
+            except NotImplementedError:
+                logger.error("Destination broker is not implemented yet.")
+                raise
             except Exception:
                 logger.exception("Unexpected copier error.")
             await asyncio.sleep(self.poll_interval)
@@ -95,8 +113,10 @@ class PositionCopier:
                 await self._handle_closed_position(source_id, position)
             else:
                 await self._handle_open_position(source_id, position)
+                await self._handle_modified_position(source_id, position)
 
         await self._handle_missing_open_positions(positions)
+        self._last_snapshot = positions
 
     async def _handle_open_position(self, source_id: str, position: Position) -> None:
         if self.mapping_store.has_open_mapping(source_id):
@@ -113,31 +133,40 @@ class PositionCopier:
                 position.side,
                 position.volume,
             )
-            result = await self.api_client.open_position(
-                symbol=position.symbol,
-                side=position.side,
-                volume_lots=position.volume,
-                stop_loss=position.sl,
-                take_profit=position.tp,
-                label=source_id,
-            )
-            mapping = PositionMapping(
-                source_position_id=source_id,
-                destination_position_id=int(result["destination_position_id"]),
-                symbol=position.symbol,
-                side=position.side,
-                volume=position.volume,
-                api_volume=int(result["api_volume"]),
-            )
-            self.mapping_store.add(mapping)
-            self.mapping_store.save()
+            destination_id = await self.executor.open_position(position)
             logger.info(
                 "Mapped source position %s -> destination position %s",
                 source_id,
-                mapping.destination_position_id,
+                destination_id,
             )
         finally:
             self._pending_opens.discard(source_id)
+
+    async def _handle_modified_position(self, source_id: str, position: Position) -> None:
+        if not self.mapping_store.has_open_mapping(source_id):
+            return
+        if source_id in self._pending_modifies:
+            return
+
+        previous = self._last_snapshot.get(source_id)
+        if previous is None or not self._position_modified(previous, position):
+            return
+
+        self._pending_modifies.add(source_id)
+        try:
+            logger.info(
+                "Detected modify on source position %s: sl %s->%s tp %s->%s volume %s->%s",
+                source_id,
+                previous.sl,
+                position.sl,
+                previous.tp,
+                position.tp,
+                previous.volume,
+                position.volume,
+            )
+            await self.executor.modify_position(source_id, position)
+        finally:
+            self._pending_modifies.discard(source_id)
 
     async def _handle_closed_position(self, source_id: str, position: Position) -> None:
         if source_id in self._pending_closes:
@@ -150,21 +179,11 @@ class PositionCopier:
         self._pending_closes.add(source_id)
         try:
             logger.info(
-                "Source position %s closed on monitor account. Closing destination %s.",
+                "Source position %s closed. Closing destination mapping %s.",
                 source_id,
                 mapping.destination_position_id,
             )
-            await self.api_client.close_position(
-                mapping.destination_position_id,
-                mapping.api_volume,
-            )
-            self.mapping_store.mark_closed(source_id)
-            self.mapping_store.save()
-            logger.info(
-                "Closed destination position %s for source position %s",
-                mapping.destination_position_id,
-                source_id,
-            )
+            await self.executor.close_position(source_id, position)
         finally:
             self._pending_closes.discard(source_id)
 
@@ -185,31 +204,31 @@ class PositionCopier:
                 )
                 await self._handle_closed_position(source_id, synthetic)
 
-    async def _reconnect_api(self) -> None:
-        try:
-            await self.api_client.reconnect()
-            logger.info("cTrader API reconnected successfully.")
-        except Exception:
-            logger.exception("Failed to reconnect to cTrader API.")
-            await asyncio.sleep(self.poll_interval)
+    @staticmethod
+    def _position_modified(previous: Position, current: Position) -> bool:
+        return (
+            previous.sl != current.sl
+            or previous.tp != current.tp
+            or previous.volume != current.volume
+        )
 
 
 async def main() -> None:
-    api_client = CTraderTradingClient.from_env()
     mapping_store = MappingStore(MAPPING_FILE)
+    executor = build_executor(mapping_store)
     copier = PositionCopier(
-        api_client=api_client,
+        executor=executor,
         positions_file=POSITIONS_FILE,
         mapping_store=mapping_store,
     )
 
-    await api_client.connect()
+    await executor.connect()
     try:
         await copier.run()
     except KeyboardInterrupt:
         logger.info("Copier stopped by user.")
     finally:
-        await api_client.disconnect()
+        await executor.disconnect()
 
 
 if __name__ == "__main__":

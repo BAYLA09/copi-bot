@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from decimal import Decimal
 from typing import Any
 
 from ctrader_api_client import CTraderClient, ClientConfig
-from ctrader_api_client.enums import OrderSide, OrderType
+from ctrader_api_client.enums import ExecutionType, OrderSide, OrderType
 from ctrader_api_client.events import (
     ClientDisconnectEvent,
+    ExecutionEvent,
     ReadyEvent,
     ReconnectedEvent,
     TokenInvalidatedEvent,
@@ -16,15 +18,28 @@ from ctrader_api_client.events import (
 from ctrader_api_client.models import ClosePositionRequest, NewOrderRequest, Symbol
 from dotenv import load_dotenv
 
+from models import Position as TrackedPosition
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_API_HOST = "demo.ctraderapi.com"
+SOURCE_ENV_PREFIX = "CTRADER_SOURCE_"
+DEST_ENV_PREFIX = "CTRADER_"
 
 
 class CTraderAPIError(RuntimeError):
     """Raised when a cTrader Open API operation fails."""
+
+
+def _env(name: str, *, prefix: str = DEST_ENV_PREFIX, fallback: str = "") -> str:
+    prefixed = os.getenv(f"{prefix}{name}", "").strip()
+    if prefixed:
+        return prefixed
+    if prefix != DEST_ENV_PREFIX:
+        return os.getenv(f"{DEST_ENV_PREFIX}{name}", fallback).strip()
+    return fallback
 
 
 class CTraderTradingClient:
@@ -49,6 +64,8 @@ class CTraderTradingClient:
         self._token_expires_at = token_expires_at
         self._account_id: int | None = None
         self._symbol_cache: dict[str, Symbol] = {}
+        self._symbol_names: dict[int, str] = {}
+        self._execution_queue: asyncio.Queue[ExecutionEvent] = asyncio.Queue()
         self._client = CTraderClient(
             ClientConfig(
                 client_id=client_id,
@@ -60,24 +77,25 @@ class CTraderTradingClient:
         self._register_event_handlers()
 
     @classmethod
-    def from_env(cls) -> CTraderTradingClient:
-        client_id = os.getenv("CTRADER_CLIENT_ID", "").strip()
-        client_secret = os.getenv("CTRADER_CLIENT_SECRET", "").strip()
-        access_token = os.getenv("CTRADER_ACCESS_TOKEN", "").strip()
-        refresh_token = os.getenv("CTRADER_REFRESH_TOKEN", "").strip()
-        expires_raw = os.getenv("CTRADER_TOKEN_EXPIRES_AT", "").strip()
-        trader_login_raw = os.getenv("CTRADER_TRADER_LOGIN", "").strip()
-        host = os.getenv("CTRADER_API_HOST", DEFAULT_API_HOST).strip()
+    def from_env(cls, *, role: str = "destination") -> CTraderTradingClient:
+        prefix = SOURCE_ENV_PREFIX if role == "source" else DEST_ENV_PREFIX
+        client_id = _env("CLIENT_ID", prefix=prefix)
+        client_secret = _env("CLIENT_SECRET", prefix=prefix)
+        access_token = _env("ACCESS_TOKEN", prefix=prefix)
+        refresh_token = _env("REFRESH_TOKEN", prefix=prefix)
+        expires_raw = _env("TOKEN_EXPIRES_AT", prefix=prefix)
+        trader_login_raw = _env("TRADER_LOGIN", prefix=prefix)
+        host = _env("API_HOST", prefix=prefix, fallback=DEFAULT_API_HOST)
 
         missing = [
             name
             for name, value in {
-                "CTRADER_CLIENT_ID": client_id,
-                "CTRADER_CLIENT_SECRET": client_secret,
-                "CTRADER_ACCESS_TOKEN": access_token,
-                "CTRADER_REFRESH_TOKEN": refresh_token,
-                "CTRADER_TOKEN_EXPIRES_AT": expires_raw,
-                "CTRADER_TRADER_LOGIN": trader_login_raw,
+                f"{prefix}CLIENT_ID": client_id,
+                f"{prefix}CLIENT_SECRET": client_secret,
+                f"{prefix}ACCESS_TOKEN": access_token,
+                f"{prefix}REFRESH_TOKEN": refresh_token,
+                f"{prefix}TOKEN_EXPIRES_AT": expires_raw,
+                f"{prefix}TRADER_LOGIN": trader_login_raw,
             }.items()
             if not value
         ]
@@ -111,6 +129,12 @@ class CTraderTradingClient:
         return self._account_id
 
     def _register_event_handlers(self) -> None:
+        @self._client.on(ExecutionEvent)
+        async def on_execution(event: ExecutionEvent) -> None:
+            if self._account_id is not None and event.account_id != self._account_id:
+                return
+            await self._execution_queue.put(event)
+
         @self._client.on(ReconnectedEvent)
         async def on_reconnected(event: ReconnectedEvent) -> None:
             logger.warning(
@@ -186,6 +210,55 @@ class CTraderTradingClient:
             symbol.lot_size,
         )
         return symbol
+
+    async def get_symbol_name(self, symbol_id: int) -> str:
+        if symbol_id in self._symbol_names:
+            return self._symbol_names[symbol_id]
+
+        symbols = await self._client.symbols.list_all(self.account_id)
+        for item in symbols:
+            self._symbol_names[item.symbol_id] = item.name.upper()
+
+        return self._symbol_names.get(symbol_id, f"SYMBOL_{symbol_id}")
+
+    async def fetch_tracked_positions(self) -> dict[str, TrackedPosition]:
+        api_positions = await self._client.trading.get_open_positions(self.account_id)
+        tracked: dict[str, TrackedPosition] = {}
+
+        for api_position in api_positions:
+            symbol_name = await self.get_symbol_name(api_position.symbol_id)
+            symbol_info = await self.resolve_symbol(symbol_name)
+            volume_lots = float(
+                symbol_info.volume_to_lots(api_position.volume)
+            )
+            side = "Buy" if api_position.side == OrderSide.BUY else "Sell"
+            position_id = str(api_position.position_id)
+
+            tracked[position_id] = TrackedPosition(
+                position_id=position_id,
+                symbol=symbol_name,
+                side=side,
+                entry_price=float(api_position.entry_price),
+                current_price=None,
+                volume=volume_lots,
+                sl=(
+                    float(api_position.stop_loss)
+                    if api_position.stop_loss is not None
+                    else None
+                ),
+                tp=(
+                    float(api_position.take_profit)
+                    if api_position.take_profit is not None
+                    else None
+                ),
+            )
+
+        return tracked
+
+    async def wait_for_execution_event(self, timeout: float | None = 30.0) -> ExecutionEvent:
+        if timeout is None:
+            return await self._execution_queue.get()
+        return await asyncio.wait_for(self._execution_queue.get(), timeout=timeout)
 
     def lots_to_api_volume(self, symbol: Symbol, volume_lots: float) -> int:
         api_volume = symbol.lots_to_volume(Decimal(str(volume_lots)))
