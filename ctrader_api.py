@@ -136,7 +136,7 @@ class CTraderTradingClient:
             )
 
     async def connect(self) -> None:
-        logger.info("Connecting to cTrader Open API host=%s", self._client._config.host)
+        logger.info("Connecting to cTrader Open API host=%s", self.host)
         await self._client.__aenter__()
         await self._client.auth.authenticate_app()
         logger.info("cTrader application authenticated.")
