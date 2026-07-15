@@ -8,7 +8,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from abstractions import PositionChangeType, PositionEvent
+from env_file import upsert_env_values
+from login import ensure_fresh_tokens
 from ctrader_api import CTraderTradingClient
 from models import PositionStore
 from sources.ctrader_openapi import CTraderOpenAPISource
@@ -34,6 +35,7 @@ def apply_event(store: PositionStore, event: PositionEvent) -> None:
 
 
 async def run_monitor() -> None:
+    ensure_fresh_tokens()
     store = PositionStore(POSITIONS_FILE)
     client = CTraderTradingClient.from_env(role="source")
     source = CTraderOpenAPISource(client)
