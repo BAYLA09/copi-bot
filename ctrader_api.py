@@ -85,7 +85,9 @@ class CTraderTradingClient:
         refresh_token = _env("REFRESH_TOKEN", prefix=prefix)
         expires_raw = _env("TOKEN_EXPIRES_AT", prefix=prefix)
         trader_login_raw = _env("TRADER_LOGIN", prefix=prefix)
-        host = _env("API_HOST", prefix=prefix, fallback=DEFAULT_API_HOST)
+        host = _env("API_HOST", prefix=prefix, fallback="")
+        if not host:
+            host = "live.ctraderapi.com" if prefix == DEST_ENV_PREFIX else DEFAULT_API_HOST
 
         missing = [
             name

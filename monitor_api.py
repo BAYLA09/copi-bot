@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from abstractions import PositionChangeType, PositionEvent
 from env_file import upsert_env_values
 from login import ensure_fresh_tokens
 from ctrader_api import CTraderTradingClient

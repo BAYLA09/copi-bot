@@ -13,6 +13,7 @@ from ctrader_api import CTraderAPIError, CTraderTradingClient
 from destinations.base import BaseDestinationExecutor
 from destinations.ctrader import CTraderDestinationExecutor
 from destinations.ftmo import FTMOTDestinationExecutor
+from login import ensure_fresh_tokens
 from models import MappingStore, Position
 
 load_dotenv()
@@ -32,10 +33,18 @@ DESTINATION_BROKER = os.getenv("DESTINATION_BROKER", "ctrader").strip().lower()
 
 def build_executor(mapping_store: MappingStore) -> BaseDestinationExecutor:
     if DESTINATION_BROKER == "ftmo":
-        return FTMOTDestinationExecutor()
+        return FTMOTDestinationExecutor(mapping_store)
 
     client = CTraderTradingClient.from_env(role="destination")
     return CTraderDestinationExecutor(client, mapping_store)
+
+
+def _executor_client(executor: BaseDestinationExecutor) -> CTraderTradingClient | None:
+    if isinstance(executor, CTraderDestinationExecutor):
+        return executor.client
+    if isinstance(executor, FTMOTDestinationExecutor):
+        return executor.client
+    return None
 
 
 class PositionCopier:
@@ -72,8 +81,9 @@ class PositionCopier:
                     await self._process_positions()
             except CTraderAPIError:
                 logger.exception("Destination API error while copying trades.")
-                if isinstance(self.executor, CTraderDestinationExecutor):
-                    await self.executor.client.reconnect()
+                client = _executor_client(self.executor)
+                if client is not None:
+                    await client.reconnect()
             except NotImplementedError:
                 logger.error("Destination broker is not implemented yet.")
                 raise
@@ -222,6 +232,7 @@ async def main() -> None:
         mapping_store=mapping_store,
     )
 
+    ensure_fresh_tokens(role="destination")
     await executor.connect()
     try:
         await copier.run()
